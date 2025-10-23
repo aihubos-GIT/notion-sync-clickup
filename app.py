@@ -1,5 +1,6 @@
 """
-Flask Web Service đơn giản cho Render - Sync Notion to ClickUp
+Flask wrapper để chạy sync script như Web Service trên Render
+Fixed: Sử dụng Render Disk để lưu file persistent
 """
 
 from flask import Flask, jsonify
@@ -20,8 +21,11 @@ NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 CLICKUP_API_TOKEN = os.getenv("CLICKUP_API_TOKEN")
 CLICKUP_LIST_ID = os.getenv("CLICKUP_LIST_ID")
 
-# Lưu state trong memory (sẽ reset khi service restart)
-KNOWN_TASKS_STATE = os.getenv("KNOWN_TASKS_STATE", "{}")
+# Render Disk Path - File sẽ được lưu ở đây và không bị mất
+RENDER_DISK_PATH = os.getenv("RENDER_DISK_PATH", ".")
+KNOWN_TASKS_FILE = os.path.join(RENDER_DISK_PATH, "known_tasks.json")
+
+print(f"📁 Data path: {KNOWN_TASKS_FILE}")
 
 app = Flask(__name__)
 
@@ -35,30 +39,31 @@ sync_status = {
     "service_started": datetime.now().isoformat()
 }
 
-# In-memory storage
-known_tasks_memory = None
-
 # ============ STATE MANAGEMENT ============
 def load_known_tasks():
-    global known_tasks_memory
+    if os.path.exists(KNOWN_TASKS_FILE):
+        try:
+            with open(KNOWN_TASKS_FILE, 'r') as f:
+                data = json.load(f)
+                print(f"📖 Loaded state: {len(data.get('task_ids', []))} tasks, initialized: {data.get('initialized', False)}")
+                return data
+        except Exception as e:
+            print(f"⚠️  Lỗi đọc file: {e}")
+            return {"task_ids": [], "initialized": False}
     
-    # Load từ memory nếu đã có
-    if known_tasks_memory:
-        return known_tasks_memory
-    
-    # Load từ env variable lần đầu
-    try:
-        state = json.loads(KNOWN_TASKS_STATE)
-        known_tasks_memory = state
-        return state
-    except:
-        known_tasks_memory = {"task_ids": [], "initialized": False}
-        return known_tasks_memory
+    print("📝 File chưa tồn tại, tạo mới...")
+    return {"task_ids": [], "initialized": False}
 
 def save_known_tasks(known_tasks):
-    global known_tasks_memory
-    known_tasks_memory = known_tasks
-    # Note: Chỉ lưu trong memory, không persistent
+    try:
+        # Tạo thư mục nếu chưa có
+        os.makedirs(os.path.dirname(KNOWN_TASKS_FILE), exist_ok=True)
+        
+        with open(KNOWN_TASKS_FILE, 'w') as f:
+            json.dump(known_tasks, f, indent=2)
+        print(f"💾 Saved state: {len(known_tasks.get('task_ids', []))} tasks")
+    except Exception as e:
+        print(f"❌ Lỗi lưu file: {e}")
 
 # ============ STATUS & PRIORITY MAPPING ============
 def map_notion_status_to_clickup(notion_status):
@@ -179,6 +184,8 @@ def get_notion_tasks():
         return response.json().get("results", [])
     except Exception as e:
         print(f"❌ Lỗi lấy data từ Notion: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            print(f"Response: {e.response.text}")
         return []
 
 def format_notion_task(page):
@@ -263,6 +270,8 @@ def create_clickup_task(task_data):
         return response.json()
     except Exception as e:
         print(f"❌ Lỗi tạo task ClickUp: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            print(f"Response: {e.response.text}")
         return None
 
 def update_clickup_task(task_id, task_data):
@@ -329,7 +338,7 @@ def get_clickup_task_by_notion_id(notion_id):
 def sync_notion_to_clickup():
     global sync_status
     
-    print(f"\n🔄 Checking... {datetime.now().strftime('%H:%M:%S')}")
+    print(f"\n🔄 Checking for new tasks... {datetime.now().strftime('%H:%M:%S')}")
     
     known_data = load_known_tasks()
     known_task_ids = set(known_data.get("task_ids", []))
@@ -343,8 +352,10 @@ def sync_notion_to_clickup():
     current_task_ids = [task.get("id") for task in notion_tasks]
     
     if not is_initialized:
-        print("🎯 Lần đầu - Lưu snapshot")
-        print(f"   📝 {len(current_task_ids)} tasks")
+        print("🎯 Lần đầu chạy - Đang lưu snapshot của tasks hiện tại...")
+        print(f"   📝 Tìm thấy {len(current_task_ids)} tasks có sẵn")
+        print("   ⏭️  Bỏ qua việc sync các tasks này")
+        print("   ✅ Từ giờ sẽ chỉ sync tasks MỚI được tạo!")
         
         known_data = {
             "task_ids": current_task_ids,
@@ -360,9 +371,11 @@ def sync_notion_to_clickup():
         print("   ✨ Không có task mới")
         return
     
-    print(f"   🆕 {len(new_task_ids)} task mới!")
+    print(f"   🆕 Phát hiện {len(new_task_ids)} task mới!")
     
     created = 0
+    updated = 0
+    errors = 0
     
     for notion_page in notion_tasks:
         notion_id = notion_page.get("id")
@@ -372,50 +385,59 @@ def sync_notion_to_clickup():
         
         try:
             task_data = format_notion_task(notion_page)
-            result = create_clickup_task(task_data)
+            clickup_task_id = get_clickup_task_by_notion_id(notion_id)
             
-            if result:
-                created += 1
-                print(f"      ✨ {task_data['name']}")
+            if clickup_task_id:
+                result = update_clickup_task(clickup_task_id, task_data)
+                if result:
+                    updated += 1
+                    print(f"      🔄 Updated: {task_data['name']}")
+                else:
+                    errors += 1
+            else:
+                result = create_clickup_task(task_data)
+                if result:
+                    created += 1
+                    print(f"      ✨ Created: {task_data['name']}")
+                else:
+                    errors += 1
             
             known_task_ids.add(notion_id)
-            time.sleep(0.5)
+            time.sleep(0.3)
             
         except Exception as e:
-            print(f"      ❌ Lỗi: {e}")
-            sync_status["errors"] += 1
+            print(f"      ❌ Lỗi sync task: {e}")
+            errors += 1
             sync_status["last_error"] = str(e)
     
     known_data["task_ids"] = list(known_task_ids)
     save_known_tasks(known_data)
     
-    if created > 0:
-        print(f"   ✅ Sync xong: {created} tasks")
-        sync_status["total_synced"] += created
+    if created > 0 or updated > 0:
+        print(f"   ✅ Sync done: {created} created, {updated} updated")
+        sync_status["total_synced"] += created + updated
+        if errors > 0:
+            print(f"   ⚠️  {errors} errors")
+            sync_status["errors"] += errors
     
     sync_status["last_sync"] = datetime.now().isoformat()
 
-# ============ BACKGROUND SYNC ============
+# ============ BACKGROUND SYNC THREAD ============
 def background_sync_loop():
     global sync_status
     
     sync_status["running"] = True
-    
-    # Đợi 5s cho service khởi động
-    time.sleep(5)
+    sync_interval = 15
     
     print("🔍 Loading ClickUp users...")
     users = get_clickup_users()
-    print(f"✅ {len(users)} users")
-    
-    # Sync interval: 30 giây (cho Render Free)
-    sync_interval = 30
+    print(f"✅ Found {len(users)} users")
     
     while sync_status["running"]:
         try:
             sync_notion_to_clickup()
         except Exception as e:
-            print(f"❌ Sync error: {e}")
+            print(f"❌ Error in sync: {e}")
             sync_status["errors"] += 1
             sync_status["last_error"] = str(e)
         
@@ -425,7 +447,6 @@ def background_sync_loop():
 @app.route('/')
 def home():
     known_data = load_known_tasks()
-    
     return jsonify({
         "status": "running",
         "service": "Notion → ClickUp Sync",
@@ -435,77 +456,62 @@ def home():
         "errors": sync_status["errors"],
         "last_error": sync_status["last_error"],
         "known_tasks": len(known_data.get("task_ids", [])),
-        "initialized": known_data.get("initialized", False)
+        "initialized": known_data.get("initialized", False),
+        "data_path": KNOWN_TASKS_FILE
     })
 
 @app.route('/health')
 def health():
-    """Health check endpoint - để Render/monitoring service ping"""
-    return jsonify({
-        "status": "ok",
-        "timestamp": datetime.now().isoformat()
-    }), 200
+    return jsonify({"status": "ok"}), 200
 
 @app.route('/status')
 def status():
-    """Chi tiết status"""
     known_data = load_known_tasks()
     return jsonify({
-        "sync_running": sync_status["running"],
-        "last_sync": sync_status["last_sync"],
-        "total_synced": sync_status["total_synced"],
-        "errors": sync_status["errors"],
-        "known_tasks_count": len(known_data.get("task_ids", [])),
+        "sync_status": sync_status,
+        "known_tasks": len(known_data.get("task_ids", [])),
         "initialized": known_data.get("initialized", False),
-        "service_uptime": sync_status["service_started"]
+        "initialized_at": known_data.get("initialized_at", None),
+        "data_path": KNOWN_TASKS_FILE,
+        "file_exists": os.path.exists(KNOWN_TASKS_FILE)
     })
 
 @app.route('/trigger')
 def trigger():
-    """Manual trigger sync"""
     try:
         sync_notion_to_clickup()
-        return jsonify({
-            "status": "success", 
-            "message": "Sync triggered",
-            "timestamp": datetime.now().isoformat()
-        })
+        return jsonify({"status": "success", "message": "Sync triggered manually"})
     except Exception as e:
-        return jsonify({
-            "status": "error", 
-            "message": str(e)
-        }), 500
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/reset')
 def reset():
-    """Reset state (cẩn thận!)"""
-    global known_tasks_memory
-    known_tasks_memory = {"task_ids": [], "initialized": False}
-    return jsonify({
-        "status": "success",
-        "message": "State reset - sẽ re-initialize ở lần sync tiếp theo"
-    })
-
-@app.route('/export-state')
-def export_state():
-    """Export state để backup"""
-    known_data = load_known_tasks()
-    return jsonify({
-        "state": known_data,
-        "timestamp": datetime.now().isoformat(),
-        "note": "Copy state này và set vào env var KNOWN_TASKS_STATE để persistent"
-    })
+    """Reset state - Xóa file và bắt đầu lại từ đầu"""
+    try:
+        if os.path.exists(KNOWN_TASKS_FILE):
+            os.remove(KNOWN_TASKS_FILE)
+            return jsonify({
+                "status": "success",
+                "message": "State reset - sẽ re-initialize ở lần sync tiếp theo"
+            })
+        else:
+            return jsonify({
+                "status": "info",
+                "message": "File không tồn tại"
+            })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == '__main__':
     print("=" * 60)
-    print("🚀 Notion → ClickUp Sync Service")
+    print("🚀 Notion → ClickUp Flask Sync Service")
     print("=" * 60)
     
-    # Start background sync
+    # Start background sync thread
     sync_thread = threading.Thread(target=background_sync_loop, daemon=True)
     sync_thread.start()
-    print("✅ Background sync started")
+    print("✅ Background sync thread started")
     
-    # Start Flask
+    # Start Flask app
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
