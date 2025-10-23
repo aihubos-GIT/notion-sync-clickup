@@ -1,11 +1,12 @@
 """
-Notion to ClickUp Realtime Sync Script
-Chỉ sync tasks MỚI được tạo sau khi script chạy (không sync tasks cũ)
+Flask wrapper để chạy sync script như Web Service trên Render
 """
 
-import requests
+from flask import Flask, jsonify
+import threading
 import time
 from datetime import datetime
+import requests
 import os
 import json
 from dotenv import load_dotenv
@@ -16,16 +17,23 @@ load_dotenv()
 # ============ CONFIGURATION ============
 NOTION_API_TOKEN = os.getenv("NOTION_API_TOKEN")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
-
 CLICKUP_API_TOKEN = os.getenv("CLICKUP_API_TOKEN")
 CLICKUP_LIST_ID = os.getenv("CLICKUP_LIST_ID")
-
-# File tracking các tasks đã biết (để detect tasks mới)
 KNOWN_TASKS_FILE = "known_tasks.json"
+
+app = Flask(__name__)
+
+# Global state
+sync_status = {
+    "running": False,
+    "last_sync": None,
+    "total_synced": 0,
+    "errors": 0,
+    "last_error": None
+}
 
 # ============ STATE MANAGEMENT ============
 def load_known_tasks():
-    """Load danh sách các Notion task IDs đã biết"""
     if os.path.exists(KNOWN_TASKS_FILE):
         try:
             with open(KNOWN_TASKS_FILE, 'r') as f:
@@ -35,13 +43,11 @@ def load_known_tasks():
     return {"task_ids": [], "initialized": False}
 
 def save_known_tasks(known_tasks):
-    """Lưu danh sách Notion task IDs"""
     with open(KNOWN_TASKS_FILE, 'w') as f:
         json.dump(known_tasks, f, indent=2)
 
 # ============ STATUS & PRIORITY MAPPING ============
 def map_notion_status_to_clickup(notion_status):
-    """Map Notion status sang ClickUp status"""
     status_mapping = {
         "Chưa bắt đầu": "to do",
         "Đang thực hiện": "in progress",
@@ -55,7 +61,6 @@ def map_notion_status_to_clickup(notion_status):
     return status_mapping.get(notion_status, "to do")
 
 def map_notion_priority_to_clickup(notion_priority):
-    """Map Notion priority sang ClickUp priority"""
     priority_mapping = {
         "Cao (High)": 1,
         "High": 1,
@@ -72,7 +77,6 @@ def map_notion_priority_to_clickup(notion_priority):
 clickup_users_cache = None
 
 def get_clickup_users():
-    """Lấy danh sách users từ ClickUp workspace"""
     global clickup_users_cache
     
     if clickup_users_cache:
@@ -119,7 +123,6 @@ def get_clickup_users():
     return {}
 
 def map_notion_assignees_to_clickup(notion_assignees):
-    """Map Notion assignees sang ClickUp user IDs"""
     if not notion_assignees:
         return []
     
@@ -139,7 +142,6 @@ def map_notion_assignees_to_clickup(notion_assignees):
 
 # ============ NOTION API ============
 def get_notion_tasks():
-    """Lấy danh sách tasks từ Notion Database"""
     url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
     
     headers = {
@@ -148,7 +150,6 @@ def get_notion_tasks():
         "Notion-Version": "2022-06-28"
     }
     
-    # Sort by created_time desc để lấy tasks mới nhất trước
     payload = {
         "sorts": [
             {
@@ -169,42 +170,34 @@ def get_notion_tasks():
         return []
 
 def format_notion_task(page):
-    """Format task data từ Notion"""
     props = page.get("properties", {})
     
-    # Lấy title
     title_prop = (props.get("Tên công việc", {}) or 
                   props.get("Name", {}) or 
                   props.get("Task", {})).get("title", [])
     name = title_prop[0]["text"]["content"] if title_prop else "Untitled"
     
-    # Lấy status
     status_prop = (props.get("Trạng thái", {}) or 
                    props.get("Status", {})).get("status", {})
     status = status_prop.get("name", "Chưa bắt đầu") if status_prop else "Chưa bắt đầu"
     
-    # Lấy priority
     priority_prop = (props.get("Mức độ ưu tiên", {}) or 
                      props.get("Priority", {})).get("select", {})
     priority = priority_prop.get("name", "Trung bình (Medium)") if priority_prop else "Trung bình (Medium)"
     
-    # Lấy deadline
     deadline_prop = (props.get("Deadline", {}) or 
                      props.get("Due Date", {})).get("date", {})
     deadline = deadline_prop.get("start") if deadline_prop else None
     
-    # Lấy assignees
     assignees_prop = (props.get("Phân công", {}) or 
                       props.get("Assign", {}) or 
                       props.get("Assignee", {})).get("people", [])
     assignees = [{"name": p.get("name", ""), "email": p.get("email", "")} 
                  for p in assignees_prop]
     
-    # Lấy IDs và timestamps
     notion_id = page.get("id", "")
     created_time = page.get("created_time", "")
     
-    # Lấy description
     ghi_chu_prop = (props.get("Ghi chú", {}) or 
                     props.get("Description", {})).get("rich_text", [])
     description = ghi_chu_prop[0]["text"]["content"] if ghi_chu_prop else ""
@@ -222,7 +215,6 @@ def format_notion_task(page):
 
 # ============ CLICKUP API ============
 def create_clickup_task(task_data):
-    """Tạo task mới trong ClickUp"""
     url = f"https://api.clickup.com/api/v2/list/{CLICKUP_LIST_ID}/task"
     
     headers = {
@@ -230,7 +222,6 @@ def create_clickup_task(task_data):
         "Content-Type": "application/json"
     }
     
-    # Convert deadline
     due_date = None
     if task_data["deadline"]:
         try:
@@ -239,7 +230,6 @@ def create_clickup_task(task_data):
         except:
             pass
     
-    # Map assignees
     assignee_ids = map_notion_assignees_to_clickup(task_data["assignees"])
     
     payload = {
@@ -266,7 +256,6 @@ def create_clickup_task(task_data):
         return None
 
 def update_clickup_task(task_id, task_data):
-    """Update task trong ClickUp"""
     url = f"https://api.clickup.com/api/v2/task/{task_id}"
     
     headers = {
@@ -274,7 +263,6 @@ def update_clickup_task(task_id, task_data):
         "Content-Type": "application/json"
     }
     
-    # Convert deadline
     due_date = None
     if task_data["deadline"]:
         try:
@@ -283,7 +271,6 @@ def update_clickup_task(task_id, task_data):
         except:
             pass
     
-    # Map assignees
     assignee_ids = map_notion_assignees_to_clickup(task_data["assignees"])
     
     payload = {
@@ -307,7 +294,6 @@ def update_clickup_task(task_id, task_data):
         return None
 
 def get_clickup_task_by_notion_id(notion_id):
-    """Tìm ClickUp task theo Notion ID"""
     url = f"https://api.clickup.com/api/v2/list/{CLICKUP_LIST_ID}/task"
     
     headers = {
@@ -331,22 +317,20 @@ def get_clickup_task_by_notion_id(notion_id):
 
 # ============ SYNC LOGIC ============
 def sync_notion_to_clickup():
-    """Chỉ sync tasks MỚI - không sync tasks có sẵn"""
+    global sync_status
+    
     print(f"\n🔄 Checking for new tasks... {datetime.now().strftime('%H:%M:%S')}")
     
-    # Load danh sách tasks đã biết
     known_data = load_known_tasks()
     known_task_ids = set(known_data.get("task_ids", []))
     is_initialized = known_data.get("initialized", False)
     
-    # Lấy tasks từ Notion
     notion_tasks = get_notion_tasks()
     if not notion_tasks:
         return
     
     current_task_ids = [task.get("id") for task in notion_tasks]
     
-    # Lần đầu chạy: Chỉ lưu danh sách tasks hiện tại, KHÔNG sync
     if not is_initialized:
         print("🎯 Lần đầu chạy - Đang lưu snapshot của tasks hiện tại...")
         print(f"   📝 Tìm thấy {len(current_task_ids)} tasks có sẵn")
@@ -361,7 +345,6 @@ def sync_notion_to_clickup():
         save_known_tasks(known_data)
         return
     
-    # Tìm tasks MỚI (chưa có trong known_task_ids)
     new_task_ids = [tid for tid in current_task_ids if tid not in known_task_ids]
     
     if not new_task_ids:
@@ -370,7 +353,6 @@ def sync_notion_to_clickup():
     
     print(f"   🆕 Phát hiện {len(new_task_ids)} task mới!")
     
-    # Sync chỉ các tasks mới
     created = 0
     updated = 0
     errors = 0
@@ -378,18 +360,14 @@ def sync_notion_to_clickup():
     for notion_page in notion_tasks:
         notion_id = notion_page.get("id")
         
-        # Skip tasks cũ
         if notion_id not in new_task_ids:
             continue
         
         try:
             task_data = format_notion_task(notion_page)
-            
-            # Check xem đã có trong ClickUp chưa (case update)
             clickup_task_id = get_clickup_task_by_notion_id(notion_id)
             
             if clickup_task_id:
-                # Update
                 result = update_clickup_task(clickup_task_id, task_data)
                 if result:
                     updated += 1
@@ -397,7 +375,6 @@ def sync_notion_to_clickup():
                 else:
                     errors += 1
             else:
-                # Create new
                 result = create_clickup_task(task_data)
                 if result:
                     created += 1
@@ -405,77 +382,91 @@ def sync_notion_to_clickup():
                 else:
                     errors += 1
             
-            # Thêm vào known tasks
             known_task_ids.add(notion_id)
-            
             time.sleep(0.3)
             
         except Exception as e:
             print(f"      ❌ Lỗi sync task: {e}")
             errors += 1
+            sync_status["last_error"] = str(e)
     
-    # Lưu lại known tasks
     known_data["task_ids"] = list(known_task_ids)
     save_known_tasks(known_data)
     
     if created > 0 or updated > 0:
         print(f"   ✅ Sync done: {created} created, {updated} updated")
+        sync_status["total_synced"] += created + updated
         if errors > 0:
             print(f"   ⚠️  {errors} errors")
+            sync_status["errors"] += errors
+    
+    sync_status["last_sync"] = datetime.now().isoformat()
 
-# ============ MAIN LOOP ============
-def main():
-    """Chạy sync loop"""
-    print("=" * 60)
-    print("🚀 Notion → ClickUp Realtime Sync (NEW TASKS ONLY)")
-    print("=" * 60)
+# ============ BACKGROUND SYNC THREAD ============
+def background_sync_loop():
+    global sync_status
     
-    # Kiểm tra env vars
-    required_vars = {
-        "NOTION_API_TOKEN": NOTION_API_TOKEN,
-        "NOTION_DATABASE_ID": NOTION_DATABASE_ID,
-        "CLICKUP_API_TOKEN": CLICKUP_API_TOKEN,
-        "CLICKUP_LIST_ID": CLICKUP_LIST_ID
-    }
+    sync_status["running"] = True
+    sync_interval = 15
     
-    for var_name, var_value in required_vars.items():
-        if not var_value:
-            print(f"❌ ERROR: Thiếu {var_name} trong file .env")
-            return
-    
-    print(f"📊 Notion Database: {NOTION_DATABASE_ID}")
-    print(f"📊 ClickUp List: {CLICKUP_LIST_ID}")
-    print(f"⏱️  Check interval: 15 giây")
-    print(f"💾 Tracking file: {KNOWN_TASKS_FILE}")
-    print("\n⚡ CHẾ ĐỘ REALTIME - CHỈ SYNC TASKS MỚI:")
-    print("   • Lần chạy đầu: Lưu snapshot (không sync)")
-    print("   • Các lần sau: Chỉ sync tasks mới thêm vào")
-    print("\n💡 Nhấn Ctrl+C để dừng")
-    print("=" * 60)
-    
-    # Load ClickUp users
-    print("\n🔍 Đang load ClickUp users...")
+    print("🔍 Loading ClickUp users...")
     users = get_clickup_users()
-    print(f"✅ Tìm thấy {len(users)} users")
+    print(f"✅ Found {len(users)} users")
     
-    # Chạy sync đầu tiên
+    while sync_status["running"]:
+        try:
+            sync_notion_to_clickup()
+        except Exception as e:
+            print(f"❌ Error in sync: {e}")
+            sync_status["errors"] += 1
+            sync_status["last_error"] = str(e)
+        
+        time.sleep(sync_interval)
+
+# ============ FLASK ROUTES ============
+@app.route('/')
+def home():
+    return jsonify({
+        "status": "running",
+        "service": "Notion → ClickUp Sync",
+        "last_sync": sync_status["last_sync"],
+        "total_synced": sync_status["total_synced"],
+        "errors": sync_status["errors"],
+        "last_error": sync_status["last_error"]
+    })
+
+@app.route('/health')
+def health():
+    return jsonify({"status": "ok"}), 200
+
+@app.route('/status')
+def status():
+    known_data = load_known_tasks()
+    return jsonify({
+        "sync_status": sync_status,
+        "known_tasks": len(known_data.get("task_ids", [])),
+        "initialized": known_data.get("initialized", False),
+        "initialized_at": known_data.get("initialized_at", None)
+    })
+
+@app.route('/trigger')
+def trigger():
     try:
         sync_notion_to_clickup()
+        return jsonify({"status": "success", "message": "Sync triggered manually"})
     except Exception as e:
-        print(f"❌ Lỗi: {e}")
-    
-    # Loop với interval 15s
-    sync_interval = 15
-    while True:
-        try:
-            time.sleep(sync_interval)
-            sync_notion_to_clickup()
-        except KeyboardInterrupt:
-            print("\n\n👋 Đã dừng script. Bye!")
-            break
-        except Exception as e:
-            print(f"❌ Lỗi: {e}")
-            time.sleep(sync_interval)
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    print("=" * 60)
+    print("🚀 Notion → ClickUp Flask Sync Service")
+    print("=" * 60)
+    
+    # Start background sync thread
+    sync_thread = threading.Thread(target=background_sync_loop, daemon=True)
+    sync_thread.start()
+    print("✅ Background sync thread started")
+    
+    # Start Flask app
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
