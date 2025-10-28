@@ -1,10 +1,9 @@
 """
 Flask wrapper để chạy sync script như Web Service trên Render
 Optimized: Sync tối ưu các cột, map assignees thông minh hơn
-REFACTORED v1.3: Unified logging với automation_log.json
 """
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify
 import threading
 import time
 from datetime import datetime
@@ -13,7 +12,6 @@ import os
 import json
 from dotenv import load_dotenv
 import re
-from logger_utils import logger
 
 # Load environment variables
 load_dotenv()
@@ -27,7 +25,7 @@ CLICKUP_LIST_ID = os.getenv("CLICKUP_LIST_ID")
 RENDER_DISK_PATH = os.getenv("RENDER_DISK_PATH", ".")
 KNOWN_TASKS_FILE = os.path.join(RENDER_DISK_PATH, "known_tasks.json")
 
-logger.info("system", "config_loaded", f"Data path: {KNOWN_TASKS_FILE}")
+print(f"📁 Data path: {KNOWN_TASKS_FILE}")
 
 app = Flask(__name__)
 
@@ -47,18 +45,13 @@ def load_known_tasks():
         try:
             with open(KNOWN_TASKS_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                logger.info(
-                    "notion_sync",
-                    "state_loaded",
-                    f"Loaded {len(data.get('task_ids', []))} tasks from state file",
-                    extra={"initialized": data.get('initialized', False)}
-                )
+                print(f"📖 Loaded state: {len(data.get('task_ids', []))} tasks, initialized: {data.get('initialized', False)}")
                 return data
         except Exception as e:
-            logger.error("notion_sync", "state_load_error", f"Error reading state file: {e}")
+            print(f"⚠️  Lỗi đọc file: {e}")
             return {"task_ids": [], "initialized": False}
     
-    logger.info("notion_sync", "state_init", "State file not found, creating new")
+    print("📝 File chưa tồn tại, tạo mới...")
     return {"task_ids": [], "initialized": False}
 
 def save_known_tasks(known_tasks):
@@ -66,13 +59,9 @@ def save_known_tasks(known_tasks):
         os.makedirs(os.path.dirname(KNOWN_TASKS_FILE), exist_ok=True)
         with open(KNOWN_TASKS_FILE, 'w', encoding='utf-8') as f:
             json.dump(known_tasks, f, indent=2, ensure_ascii=False)
-        logger.info(
-            "notion_sync",
-            "state_saved",
-            f"Saved state: {len(known_tasks.get('task_ids', []))} tasks"
-        )
+        print(f"💾 Saved state: {len(known_tasks.get('task_ids', []))} tasks")
     except Exception as e:
-        logger.error("notion_sync", "state_save_error", f"Error saving state file: {e}")
+        print(f"❌ Lỗi lưu file: {e}")
 
 # ============ STATUS & PRIORITY MAPPING ============
 def map_notion_status_to_clickup(notion_status):
@@ -155,7 +144,7 @@ def get_clickup_users():
         teams = response.json().get("teams", [])
         
         if not teams:
-            logger.warning("notion_sync", "no_teams", "No ClickUp teams found")
+            print("⚠️  Không tìm thấy team nào")
             return {}
         
         team_id = teams[0]["id"]
@@ -166,8 +155,7 @@ def get_clickup_users():
         
         user_map = {}
         
-        logger.info("notion_sync", "users_loading", f"Found {len(members)} ClickUp users")
-        
+        print(f"👥 Found {len(members)} ClickUp users:")
         for member in members:
             user = member.get("user", {})
             user_id = user.get("id")
@@ -183,6 +171,7 @@ def get_clickup_users():
             # Username
             if username:
                 variants.add(normalize_name(username))
+                print(f"   - {username} (ID: {user_id})")
             
             # Email full và prefix
             if email:
@@ -209,20 +198,13 @@ def get_clickup_users():
                     user_map[variant] = user_id
         
         clickup_users_cache = user_map
-        logger.success(
-            "notion_sync",
-            "users_cached",
-            f"Created {len(user_map)} name variants for matching"
-        )
+        print(f"✅ Created {len(user_map)} name variants for matching")
         return user_map
         
     except Exception as e:
-        logger.error(
-            "notion_sync",
-            "users_fetch_error",
-            f"Error fetching ClickUp users: {e}",
-            extra={"error": str(e)}
-        )
+        print(f"❌ Lỗi lấy users ClickUp: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            print(f"Response: {e.response.text}")
         return {}
 
 def map_notion_assignees_to_clickup(notion_assignees):
@@ -232,7 +214,7 @@ def map_notion_assignees_to_clickup(notion_assignees):
     
     clickup_users = get_clickup_users()
     if not clickup_users:
-        logger.warning("notion_sync", "no_users_map", "No ClickUp users available for mapping")
+        print("⚠️  Không có ClickUp users để map")
         return []
     
     clickup_ids = []
@@ -281,19 +263,9 @@ def map_notion_assignees_to_clickup(notion_assignees):
             unmatched.append(name or email)
     
     if matched:
-        logger.success(
-            "notion_sync",
-            "assignees_matched",
-            f"Matched {len(matched)} assignees",
-            extra={"matched": matched}
-        )
+        print(f"      ✅ Matched assignees: {', '.join(matched)}")
     if unmatched:
-        logger.warning(
-            "notion_sync",
-            "assignees_unmatched",
-            f"Could not match {len(unmatched)} assignees",
-            extra={"unmatched": unmatched}
-        )
+        print(f"      ⚠️  Unmatched: {', '.join(unmatched)}")
     
     return clickup_ids
 
@@ -315,16 +287,11 @@ def get_notion_tasks():
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=15)
         response.raise_for_status()
-        tasks = response.json().get("results", [])
-        logger.info("notion_sync", "tasks_fetched", f"Fetched {len(tasks)} tasks from Notion")
-        return tasks
+        return response.json().get("results", [])
     except Exception as e:
-        logger.error(
-            "notion_sync",
-            "notion_fetch_error",
-            f"Error fetching Notion tasks: {e}",
-            extra={"error": str(e)}
-        )
+        print(f"❌ Lỗi lấy data từ Notion: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            print(f"Response: {e.response.text}")
         return []
 
 def get_property_value(props, *possible_names):
@@ -416,12 +383,7 @@ def create_clickup_task(task_data):
             dt = datetime.fromisoformat(task_data["deadline"].replace('Z', '+00:00'))
             due_date = int(dt.timestamp() * 1000)
         except Exception as e:
-            logger.warning(
-                "notion_sync",
-                "deadline_parse_error",
-                f"Failed to parse deadline: {e}",
-                extra={"deadline": task_data["deadline"]}
-            )
+            print(f"      ⚠️  Lỗi parse deadline: {e}")
     
     # Map assignees
     assignee_ids = map_notion_assignees_to_clickup(task_data["assignees"])
@@ -445,12 +407,9 @@ def create_clickup_task(task_data):
         response.raise_for_status()
         return response.json()
     except Exception as e:
-        logger.error(
-            "notion_sync",
-            "clickup_create_error",
-            f"Failed to create ClickUp task: {e}",
-            extra={"task_name": task_data["name"], "error": str(e)}
-        )
+        print(f"❌ Lỗi tạo task ClickUp: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            print(f"Response: {e.response.text}")
         return None
 
 def update_clickup_task(task_id, task_data):
@@ -491,12 +450,7 @@ def update_clickup_task(task_id, task_data):
         response.raise_for_status()
         return response.json()
     except Exception as e:
-        logger.error(
-            "notion_sync",
-            "clickup_update_error",
-            f"Failed to update ClickUp task: {e}",
-            extra={"task_id": task_id, "error": str(e)}
-        )
+        print(f"❌ Lỗi update task ClickUp: {e}")
         return None
 
 def get_clickup_task_by_notion_id(notion_id):
@@ -526,7 +480,7 @@ def get_clickup_task_by_notion_id(notion_id):
 def sync_notion_to_clickup():
     global sync_status
     
-    logger.info("notion_sync", "sync_check", "Checking for new tasks")
+    print(f"\n🔄 Checking for new tasks... {datetime.now().strftime('%H:%M:%S')}")
     
     known_data = load_known_tasks()
     known_task_ids = set(known_data.get("task_ids", []))
@@ -534,21 +488,16 @@ def sync_notion_to_clickup():
     
     notion_tasks = get_notion_tasks()
     if not notion_tasks:
-        logger.warning("notion_sync", "no_tasks", "No tasks fetched from Notion")
+        print("   ⚠️  Không lấy được tasks từ Notion")
         return
     
     current_task_ids = [task.get("id") for task in notion_tasks]
     
     if not is_initialized:
-        logger.info(
-            "notion_sync",
-            "first_run",
-            f"First run - Saved snapshot of {len(current_task_ids)} existing tasks",
-            extra={
-                "total_tasks": len(current_task_ids),
-                "action": "skip_sync"
-            }
-        )
+        print("🎯 Lần đầu chạy - Đang lưu snapshot của tasks hiện tại...")
+        print(f"   📝 Tìm thấy {len(current_task_ids)} tasks có sẵn")
+        print("   ⏭️  Bỏ qua việc sync các tasks này")
+        print("   ✅ Từ giờ sẽ chỉ sync tasks MỚI được tạo!")
         
         known_data = {
             "task_ids": current_task_ids,
@@ -561,15 +510,10 @@ def sync_notion_to_clickup():
     new_task_ids = [tid for tid in current_task_ids if tid not in known_task_ids]
     
     if not new_task_ids:
-        logger.info("notion_sync", "no_new_tasks", "No new tasks detected")
+        print("   ✨ Không có task mới")
         return
     
-    logger.info(
-        "notion_sync",
-        "new_tasks_detected",
-        f"Found {len(new_task_ids)} new tasks to sync",
-        extra={"count": len(new_task_ids)}
-    )
+    print(f"   🆕 Phát hiện {len(new_task_ids)} task mới!")
     
     created = 0
     updated = 0
@@ -583,6 +527,7 @@ def sync_notion_to_clickup():
         
         try:
             task_data = format_notion_task(notion_page)
+            print(f"\n      📋 Processing: {task_data['name']}")
             
             clickup_task_id = get_clickup_task_by_notion_id(notion_id)
             
@@ -590,24 +535,14 @@ def sync_notion_to_clickup():
                 result = update_clickup_task(clickup_task_id, task_data)
                 if result:
                     updated += 1
-                    logger.success(
-                        "notion_sync",
-                        "task_updated",
-                        f"Updated task: {task_data['name']}",
-                        extra={"clickup_id": clickup_task_id, "notion_id": notion_id}
-                    )
+                    print(f"      🔄 Updated successfully")
                 else:
                     errors += 1
             else:
                 result = create_clickup_task(task_data)
                 if result:
                     created += 1
-                    logger.success(
-                        "notion_sync",
-                        "task_created",
-                        f"Created task: {task_data['name']}",
-                        extra={"clickup_id": result.get('id'), "notion_id": notion_id}
-                    )
+                    print(f"      ✨ Created successfully")
                 else:
                     errors += 1
             
@@ -615,27 +550,18 @@ def sync_notion_to_clickup():
             time.sleep(0.3)
             
         except Exception as e:
+            print(f"      ❌ Lỗi sync task: {e}")
             errors += 1
-            logger.error(
-                "notion_sync",
-                "sync_error",
-                f"Error syncing task: {str(e)}",
-                extra={"notion_id": notion_id, "error": str(e)}
-            )
             sync_status["last_error"] = str(e)
     
     known_data["task_ids"] = list(known_task_ids)
     save_known_tasks(known_data)
     
     if created > 0 or updated > 0:
-        logger.success(
-            "notion_sync",
-            "sync_completed",
-            f"Sync completed: {created} created, {updated} updated, {errors} errors",
-            extra={"created": created, "updated": updated, "errors": errors}
-        )
+        print(f"\n   ✅ Sync done: {created} created, {updated} updated")
         sync_status["total_synced"] += created + updated
         if errors > 0:
+            print(f"   ⚠️  {errors} errors")
             sync_status["errors"] += errors
     
     sync_status["last_sync"] = datetime.now().isoformat()
@@ -647,26 +573,15 @@ def background_sync_loop():
     sync_status["running"] = True
     sync_interval = 15
     
-    logger.info("notion_sync", "service_started", "Background sync thread started")
-    
-    # Load users cache
+    print("🔍 Loading ClickUp users...")
     users = get_clickup_users()
-    logger.success(
-        "notion_sync",
-        "users_ready",
-        f"Ready to match assignees with {len(users)} name variants"
-    )
+    print(f"✅ Ready to match assignees with {len(users)} name variants\n")
     
     while sync_status["running"]:
         try:
             sync_notion_to_clickup()
         except Exception as e:
-            logger.error(
-                "notion_sync",
-                "sync_loop_error",
-                f"Error in sync loop: {e}",
-                extra={"error": str(e)}
-            )
+            print(f"❌ Error in sync: {e}")
             sync_status["errors"] += 1
             sync_status["last_error"] = str(e)
         
@@ -678,7 +593,7 @@ def home():
     known_data = load_known_tasks()
     return jsonify({
         "status": "running",
-        "service": "Notion → ClickUp Sync (Optimized v1.3)",
+        "service": "Notion → ClickUp Sync (Optimized)",
         "service_started": sync_status["service_started"],
         "last_sync": sync_status["last_sync"],
         "total_synced": sync_status["total_synced"],
@@ -721,7 +636,6 @@ def reset():
     try:
         if os.path.exists(KNOWN_TASKS_FILE):
             os.remove(KNOWN_TASKS_FILE)
-            logger.info("notion_sync", "state_reset", "State file deleted, will re-initialize on next sync")
             return jsonify({
                 "status": "success",
                 "message": "State reset - sẽ re-initialize ở lần sync tiếp theo"
@@ -732,7 +646,6 @@ def reset():
                 "message": "File không tồn tại"
             })
     except Exception as e:
-        logger.error("notion_sync", "reset_error", f"Error resetting state: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/users')
@@ -744,29 +657,15 @@ def users():
         "sample_variants": list(users.keys())[:20]
     })
 
-@app.route('/logs')
-def logs():
-    """View recent logs with filters"""
-    limit = request.args.get('limit', 50, type=int)
-    level = request.args.get('level')  # INFO, ERROR, SUCCESS, WARNING
-    service = request.args.get('service', 'notion_sync')
-    
-    logs = logger.get_recent_logs(limit=limit, level=level, service=service)
-    stats = logger.get_stats()
-    
-    return jsonify({
-        "logs": logs,
-        "stats": stats,
-        "filters": {"limit": limit, "level": level, "service": service}
-    })
-
 if __name__ == '__main__':
-    logger.info("system", "startup", "🚀 Notion → ClickUp Flask Sync Service v1.3 (Refactored)")
+    print("=" * 60)
+    print("🚀 Notion → ClickUp Flask Sync Service (Optimized)")
+    print("=" * 60)
     
     # Start background sync thread
     sync_thread = threading.Thread(target=background_sync_loop, daemon=True)
     sync_thread.start()
-    logger.success("system", "thread_started", "Background sync thread started successfully")
+    print("✅ Background sync thread started")
     
     # Start Flask app
     port = int(os.environ.get('PORT', 5000))
