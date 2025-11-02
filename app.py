@@ -656,7 +656,7 @@ def users():
         "total_variants": len(users),
         "sample_variants": list(users.keys())[:20]
     })
-
+ 
 if __name__ == '__main__':
     print("=" * 60)
     print("🚀 Notion → ClickUp Flask Sync Service (Optimized)")
