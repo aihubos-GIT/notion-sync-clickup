@@ -629,7 +629,7 @@ def trigger():
         return jsonify({"status": "success", "message": "Sync triggered manually"})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
-
+ 
 @app.route('/reset')
 def reset():
     """Reset state - Xóa file và bắt đầu lại từ đầu"""
