@@ -621,7 +621,7 @@ def status():
         "file_exists": os.path.exists(KNOWN_TASKS_FILE),
         "clickup_users_cached": len(users)
     })
-
+ 
 @app.route('/trigger')
 def trigger():
     try:
